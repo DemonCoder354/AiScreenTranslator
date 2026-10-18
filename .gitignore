@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# PyInstaller output (the exe is published on the Releases page)
+build/
+dist/
+*.spec
+
+# Local settings and logs (created on first start)
+config.json
+logs/
+
+# Tesseract language data: ~100 MB, downloaded with the command in the README
+tessdata/
+
+# Windows shortcuts
+*.lnk
