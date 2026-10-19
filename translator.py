@@ -92,6 +92,14 @@ IDIOMS_PROMPT = (
 )
 MAX_IDIOM_TEXT = 4000  # characters of the text searched for idioms
 
+# A model that is not the last in its chain gets this long before the next one is
+# asked: cloud models sometimes accept a request and never answer, and waiting the
+# full request timeout (2 min) for one of them looks like a hang. Longer inputs get
+# more time, since the answer takes longer to generate.
+FALLBACK_TIMEOUT = 15.0  # seconds
+FALLBACK_TIMEOUT_PER_CHAR = 1 / 150  # extra seconds per character of input
+TIMEOUT_COOLDOWN = 60.0  # seconds a silent model is skipped
+
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 _LINE_RE = re.compile(r"^[\s*_#>-]*(lemma|translation|ipa|transcription|pronunciation|pos|"
@@ -203,6 +211,7 @@ class Translator:
         self.vision_models = tuple(vision_models)
         self.dictionary_models = tuple(dictionary_models)
         self.last_model = ""  # model that answered the latest request (for logs)
+        self.timeout = timeout
         self._cooldown_until: dict[str, float] = {}
         self._no_reasoning_param: set[str] = set()  # models that rejected reasoning_effort
         # No retries: an unreachable server or an exhausted quota must be reported quickly.
@@ -343,9 +352,14 @@ class Translator:
         # If every model is cooling down, try them anyway: a limit may have reset.
         order = ready + [m for m in models if m not in ready]
         error: TranslationError | None = None
-        for model in order:
+        size = len(system) + (len(user) if isinstance(user, str) else 2000)
+        for index, model in enumerate(order):
+            # Only a model with a fallback after it gets the short timeout.
+            timeout = None
+            if index < len(order) - 1:
+                timeout = min(self.timeout, FALLBACK_TIMEOUT + size * FALLBACK_TIMEOUT_PER_CHAR)
             try:
-                result = self._complete_once(model, system, user, temperature)
+                result = self._complete_once(model, system, user, temperature, timeout)
             except _ModelUnavailable as exc:
                 self._cooldown_until[model] = time.monotonic() + exc.cooldown
                 log.warning("%s unavailable for %.0f s, trying the next model: %s",
@@ -359,24 +373,32 @@ class Translator:
         raise error or TranslationError(tr("err.no_models"))
 
     def _complete_once(self, model: str, system: str, user: str | list[dict[str, object]],
-                       temperature: float | None = None) -> str:
+                       temperature: float | None = None, timeout: float | None = None) -> str:
         """Run one chat request and return the cleaned answer text.
 
         Not streamed on purpose: LM Studio adds ~2 s before the first streamed
         token, and the next plain request after a streamed one is slow as well;
         answers are short, so streaming would not make the cloud faster either.
 
+        ``timeout`` (seconds) replaces the client's timeout for this request; when it
+        runs out, the model counts as unavailable, so the next one is asked.
+
         Raises:
-            _ModelUnavailable: If this model is out of quota, overloaded or unknown.
+            _ModelUnavailable: If this model is out of quota, overloaded, unknown, or
+                silent past ``timeout``.
             TranslationError: With a user-facing message for every other problem.
         """
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
+        extra: dict[str, object] = {} if timeout is None else {"timeout": timeout}
         try:
-            response = self._create(model, messages, temperature)
+            response = self._create(model, messages, temperature, **extra)
         except openai.APITimeoutError as exc:
+            if timeout is not None:
+                raise _ModelUnavailable(tr("err.timeout", service=self.service),
+                                        TIMEOUT_COOLDOWN) from exc
             raise TranslationError(tr("err.timeout", service=self.service)) from exc
         except openai.APIConnectionError as exc:
             raise TranslationError(self._unreachable_message()) from exc
